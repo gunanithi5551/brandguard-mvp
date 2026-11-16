@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Python virtual environments & cache
+venv/
+.venv/
+backend/venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+.env.local
+
+# Build artifacts
+dist/
+build/
+*.log
+
+# Vector Databases
+chroma_db/
+
+# Credentials
+.env
+.env.example
+*.key
+
+# Environments
+venv/
+env/
+__pycache__/
