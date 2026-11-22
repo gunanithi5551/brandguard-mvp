@@ -1,196 +1,455 @@
 """
-CrewAI Multi-Agent Brand Compliance Engine for BrandGuard AI.
-Defines the 'Compliance Auditor' and 'Correction Editor' agents with automatic deterministic fallback
-when LLM API keys are absent during autonomous testing.
+BrandGuard AI — Multi-Agent & Multimodal Compliance Engine
+
+- Text Audit: CrewAI Compliance Agent powered by Gemini (gemini-3.5-flash-lite)
+  against active ChromaDB guidelines, with robust JSON extraction and automatic
+  fallback to direct google-genai structured JSON output so the API never throws
+  an unhandled 500 on formatting quirks.
+- Visual Audit: Direct Google Gemini Vision (gemini-3.5-flash-lite via google-genai)
+  with a strict 25-second timeout and structured JSON schema output.
+- Security: Reads GEMINI_API_KEY exclusively from environment variables (.env).
 """
+
+from __future__ import annotations
+
+import concurrent.futures
 import json
+import logging
 import os
 import re
-from typing import Dict, Any, List
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from typing import Any, Dict, List, Optional
 
-try:
-    from backend.database import query_brand_guidelines
-except ImportError:
-    from database import query_brand_guidelines
+logger = logging.getLogger("brandguard.ai_engine")
 
-_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_BACKEND_DIR, ".env"))
-load_dotenv(os.path.join(os.path.dirname(_BACKEND_DIR), ".env"))
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+import time
 
-
-class BrandReviewSchema(BaseModel):
-    status: str = Field(..., description="'flagged' if any rule is violated, otherwise 'approved'")
-    broken_rule: str = Field(..., description="The specific brand guideline rule(s) violated, or 'None'")
-    explanation: str = Field(..., description="Detailed explanation of why the content failed or passed audit")
-    suggestion: str = Field(..., description="Compliant rewrite preserving the original intent")
+FALLBACK_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.1-flash-lite",
+]
 
 
-def _extract_json_payload(raw_text: str) -> Dict[str, Any]:
-    """Safely extracts a JSON object matching BrandReviewSchema from raw LLM output."""
+def _generate_with_fallback(client, *, model: str, **kwargs):
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_err = None
+    for candidate in candidates:
+        try:
+            return client.models.generate_content(model=candidate, **kwargs)
+        except Exception as exc:
+            last_err = exc
+            if any(code in str(exc) for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
+                time.sleep(0.5)
+                continue
+            raise
+    raise last_err
+VISION_TIMEOUT_SECONDS = 25
+
+
+class AIConfigurationError(RuntimeError):
+    """Raised when GEMINI_API_KEY is missing or invalid."""
+
+
+class AITimeoutError(TimeoutError):
+    """Raised when an AI compliance audit exceeds its time budget."""
+
+
+def get_gemini_api_key() -> str:
+    """Return GEMINI_API_KEY from environment without ever hardcoding a secret."""
+    key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not key or key.lower().startswith("your_") or key == "replace_me":
+        return ""
+    return key
+
+
+def is_ai_configured() -> bool:
+    return bool(get_gemini_api_key())
+
+
+def _require_api_key() -> str:
+    key = get_gemini_api_key()
+    if not key:
+        raise AIConfigurationError(
+            "GEMINI_API_KEY is not configured. Please add a valid GEMINI_API_KEY "
+            "to your .env file or Render environment variables."
+        )
+    return key
+
+
+def _format_guidelines_block(guidelines: List[Dict[str, Any]]) -> str:
+    if not guidelines:
+        return "No active brand guidelines are currently loaded."
+    lines = []
+    for idx, rule in enumerate(guidelines, start=1):
+        title = rule.get("title", f"Rule {idx}")
+        content = rule.get("content", "")
+        lines.append(f"{idx}. [{title}] {content}")
+    return "\n".join(lines)
+
+
+def _extract_json_object(raw_text: str) -> Dict[str, Any]:
+    """Robustly extract a JSON object from LLM text, including markdown fences."""
+    if not raw_text or not isinstance(raw_text, str):
+        raise ValueError("Empty AI response")
+
+    text = raw_text.strip()
+    # Strip markdown ```json ... ``` fences if present
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
     try:
-        parsed = json.loads(raw_text)
-        validated = BrandReviewSchema(**parsed)
-        return getattr(validated, "model_dump", validated.dict)()
-    except Exception:
-        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-        if match:
-            parsed = json.loads(match.group(0))
-            validated = BrandReviewSchema(**parsed)
-            return getattr(validated, "model_dump", validated.dict)()
-        raise ValueError("Unable to parse strict JSON schema from agent output.")
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: locate outermost braces
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        parsed = json.loads(text[start : end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+
+    raise ValueError("Could not parse a valid JSON object from AI output.")
 
 
-def _run_deterministic_fallback(draft_text: str, guidelines: str) -> str:
-    """
-    Autonomous testing fallback when an LLM API key or CrewAI runtime is unavailable.
-    Evaluates the draft against the injected ChromaDB guidelines and returns a strict JSON string.
-    """
-    broken_rules: List[str] = []
-    explanations: List[str] = []
-    rewritten = draft_text
+def _normalize_status(raw_status: Any, score: int, broken_rules: List[str]) -> str:
+    val = str(raw_status or "").strip().lower()
+    if val in {"approved", "flagged", "violation"}:
+        return val
+    if val in {"pass", "passed", "compliant"}:
+        return "approved"
+    if val in {"warn", "warning", "needs_review", "review"}:
+        return "flagged"
+    if val in {"fail", "failed", "rejected", "non-compliant", "non_compliant"}:
+        return "violation"
+    if score >= 85 and not broken_rules:
+        return "approved"
+    if score >= 60:
+        return "flagged"
+    return "violation"
 
-    # Rule 2 check: Never guarantee ROI or specific financial outcomes
-    if re.search(r"\b(guarantee|guaranteed|100%\s*roi|roi|financial\s+outcome|profit)\b", draft_text, re.IGNORECASE):
-        broken_rules.append("Rule 2: Never guarantee ROI or specific financial outcomes.")
-        explanations.append(
-            "The draft explicitly guarantees ROI or specific financial outcomes, which violates Rule 2 of the Brand Guidelines."
+
+def _normalize_str_list(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return [cleaned] if cleaned else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()]
+
+
+def _clamp_score(value: Any, default: int = 50) -> int:
+    try:
+        num = int(round(float(value)))
+    except (TypeError, ValueError):
+        num = default
+    return max(0, min(100, num))
+
+
+def _normalize_text_audit(
+    payload: Dict[str, Any],
+    original_text: str,
+    guidelines_checked: int,
+) -> Dict[str, Any]:
+    broken_rules = _normalize_str_list(payload.get("broken_rules"))
+    score = _clamp_score(payload.get("score"), default=100 if not broken_rules else 40)
+    status = _normalize_status(payload.get("status"), score, broken_rules)
+    explanation = str(
+        payload.get("explanation")
+        or (
+            "The copy aligns with all active brand guidelines."
+            if status == "approved"
+            else "The copy violates one or more active brand guidelines."
         )
-        rewritten = re.sub(
-            r"We guarantee a 100% ROI",
-            "We strive to deliver measurable value and strong performance outcomes",
-            rewritten,
-            flags=re.IGNORECASE,
+    ).strip()
+    suggestion = str(payload.get("suggestion") or original_text).strip()
+
+    return {
+        "status": status,
+        "score": score,
+        "broken_rules": broken_rules,
+        "explanation": explanation,
+        "suggestion": suggestion,
+        "guidelines_checked": int(guidelines_checked),
+    }
+
+
+def _normalize_visual_audit(
+    payload: Dict[str, Any],
+    guidelines_checked: int,
+) -> Dict[str, Any]:
+    broken_rules = _normalize_str_list(payload.get("broken_rules"))
+    visual_findings = _normalize_str_list(payload.get("visual_findings"))
+    text_findings = _normalize_str_list(payload.get("text_in_image_findings"))
+    actionable_fixes = _normalize_str_list(payload.get("actionable_fixes"))
+    score = _clamp_score(payload.get("score"), default=100 if not broken_rules else 35)
+    status = _normalize_status(payload.get("status"), score, broken_rules)
+    explanation = str(
+        payload.get("explanation")
+        or (
+            "The visual asset complies with active brand guidelines."
+            if status == "approved"
+            else "The visual asset contains brand compliance issues that require revision."
         )
-        rewritten = re.sub(
-            r"\bguarantee(d)?\b",
-            "aim to deliver",
-            rewritten,
-            flags=re.IGNORECASE,
+    ).strip()
+
+    return {
+        "status": status,
+        "score": score,
+        "broken_rules": broken_rules,
+        "visual_findings": visual_findings,
+        "text_in_image_findings": text_findings,
+        "explanation": explanation,
+        "actionable_fixes": actionable_fixes,
+        "guidelines_checked": int(guidelines_checked),
+    }
+
+
+def _build_text_prompt(copy_text: str, guidelines_block: str) -> str:
+    return f"""You are BrandGuard AI, a strict enterprise brand-governance compliance auditor.
+
+Evaluate the marketing copy below ONLY against the Active Brand Guidelines provided.
+
+ACTIVE BRAND GUIDELINES:
+{guidelines_block}
+
+MARKETING COPY TO AUDIT:
+\"\"\"{copy_text}\"\"\"
+
+Return ONLY a valid JSON object (no markdown, no extra prose) with this exact schema:
+{{
+  "status": "approved" | "flagged" | "violation",
+  "score": <integer 0 to 100>,
+  "broken_rules": [<list of concise strings quoting/naming each violated rule; empty list if approved>],
+  "explanation": "<clear plain-English explanation of the compliance findings>",
+  "suggestion": "<fully compliant, polished enterprise rewrite of the copy>"
+}}
+
+Scoring rules:
+- 85-100 and empty broken_rules -> "approved"
+- 55-84 or minor tone/clarity concerns -> "flagged"
+- 0-54 or any direct policy violation -> "violation"
+"""
+
+
+def _build_vision_prompt(guidelines_block: str, caption: Optional[str]) -> str:
+    caption_section = (
+        f'OPTIONAL AD CAPTION:\n"""{caption.strip()}"""'
+        if caption and caption.strip()
+        else "OPTIONAL AD CAPTION: (none provided)"
+    )
+    return f"""You are BrandGuard AI, a strict multimodal brand-governance auditor.
+
+Inspect the attached advertisement/creative image (including all visible typography, colors, contrast, layout, and claims) and the optional caption against the Active Brand Guidelines.
+
+ACTIVE BRAND GUIDELINES:
+{guidelines_block}
+
+{caption_section}
+
+Return ONLY a valid JSON object (no markdown, no extra prose) with this exact schema:
+{{
+  "status": "approved" | "flagged" | "violation",
+  "score": <integer 0 to 100>,
+  "broken_rules": [<list of violated rules; empty list if approved>],
+  "visual_findings": [<observations about layout, colors, contrast, typography, visual hierarchy>],
+  "text_in_image_findings": [<exact text detected in the image and compliance assessment of that text>],
+  "explanation": "<clear plain-English summary of visual & textual compliance>",
+  "actionable_fixes": [<concrete, specific edits to make the creative 100% compliant; empty if approved>]
+}}
+
+Scoring rules:
+- 85-100 and empty broken_rules -> "approved"
+- 55-84 or minor visual/copy improvements needed -> "flagged"
+- 0-54 or any direct policy violation -> "violation"
+"""
+
+
+def _run_crewai_text_audit(prompt: str, api_key: str) -> str:
+    """Run CrewAI single-agent compliance review using Gemini 2.5 Flash."""
+    from crewai import Agent, Crew, LLM, Process, Task
+
+    llm = LLM(
+        model=f"gemini/{MODEL_NAME}",
+        api_key=api_key,
+        temperature=0.1,
+    )
+    auditor = Agent(
+        role="Enterprise Brand Compliance Auditor",
+        goal="Audit marketing copy strictly against active brand guidelines and output valid JSON.",
+        backstory=(
+            "You are a senior corporate brand governance specialist who enforces "
+            "tone, terminology, regulatory claims, and style rules with zero ambiguity."
+        ),
+        llm=llm,
+        verbose=False,
+        allow_delegation=False,
+    )
+    audit_task = Task(
+        description=prompt,
+        expected_output=(
+            "A single raw JSON object with keys: status, score, broken_rules, "
+            "explanation, suggestion."
+        ),
+        agent=auditor,
+    )
+    crew = Crew(
+        agents=[auditor],
+        tasks=[audit_task],
+        process=Process.sequential,
+        verbose=False,
+    )
+    result = crew.kickoff()
+    return str(result)
+
+
+def _call_gemini_text_json(prompt: str, api_key: str) -> str:
+    """Direct Google GenAI structured JSON call (used as reliable fallback)."""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    response = _generate_with_fallback(
+    client,
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+    )
+    return response.text or ""
+
+
+def _call_gemini_vision_json(
+    image_bytes: bytes,
+    mime_type: str,
+    prompt: str,
+    api_key: str,
+) -> str:
+    """Direct Google GenAI multimodal Vision call with structured JSON output."""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+    response = _generate_with_fallback(
+    client,
+        model=MODEL_NAME,   
+        contents=[prompt, image_part],
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+    )
+    return response.text or ""
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "api_key_invalid",
+            "api key not valid",
+            "invalid api key",
+            "permission denied",
+            "unauthenticated",
+            "401",
+            "403",
         )
-        rewritten = re.sub(
-            r"\b100%\s*ROI\b",
-            "high-impact operational results",
-            rewritten,
-            flags=re.IGNORECASE,
-        )
-
-    # Rule 3 check: Refer to users as 'Clients', never 'Customers'
-    if re.search(r"\bcustomers?\b", draft_text, re.IGNORECASE):
-        broken_rules.append("Rule 3: Refer to users as 'Clients', never 'Customers'.")
-        explanations.append(
-            "The draft refers to users as 'customers' instead of the mandated term 'Clients' (Rule 3)."
-        )
-        rewritten = re.sub(r"\bcustomers\b", "Clients", rewritten, flags=re.IGNORECASE)
-        rewritten = re.sub(r"\bcustomer\b", "Client", rewritten, flags=re.IGNORECASE)
-
-    # Rule 1 check: Always use a professional tone (check excessive exclamation marks or slang)
-    if "!" in draft_text or re.search(r"\b(awesome|crazy|insane|guaranteed)\b", draft_text, re.IGNORECASE):
-        if "!" in draft_text:
-            broken_rules.append("Rule 1: Always use a professional tone.")
-            explanations.append(
-                "Exclamatory promotional punctuation ('!') undermines an enterprise professional tone (Rule 1)."
-            )
-            rewritten = rewritten.replace("!", ".")
-
-    # Clean up double periods if any
-    rewritten = re.sub(r"\.{2,}", ".", rewritten).strip()
-
-    if broken_rules:
-        result = BrandReviewSchema(
-            status="flagged",
-            broken_rule=" | ".join(broken_rules),
-            explanation=" ".join(explanations) + f" [Audited against ChromaDB: {guidelines}]",
-            suggestion=rewritten,
-        )
-    else:
-        result = BrandReviewSchema(
-            status="approved",
-            broken_rule="None",
-            explanation="The submitted content adheres to all BrandGuard AI corporate tone, financial claim, and terminology rules.",
-            suggestion=draft_text,
-        )
-
-    return json.dumps(getattr(result, "model_dump", result.dict)())
-
-
-def run_brand_check(draft_text: str) -> str:
-    """
-    Queries ChromaDB for brand guidelines, executes the CrewAI Compliance Auditor and Correction Editor
-    workflow, and returns a strict JSON string matching BrandReviewSchema.
-    Falls back to deterministic schema evaluation if an LLM API key is missing during internal testing.
-    """
-    guidelines = query_brand_guidelines(draft_text)
-    def _valid_key(val):
-        return bool(val and val.strip() and not val.strip().startswith("your_"))
-
-    has_api_key = any(
-        _valid_key(os.getenv(k))
-        for k in ("OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY")
     )
 
-    if has_api_key:
+
+def review_text_compliance(
+    text: str,
+    guidelines: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Audit marketing copy using CrewAI + Gemini (gemini-3.5-flash-lite), automatically
+    falling back to direct Gemini structured JSON output if CrewAI formatting or
+    execution fails.
+    """
+    api_key = _require_api_key()
+    guidelines_block = _format_guidelines_block(guidelines)
+    prompt = _build_text_prompt(text, guidelines_block)
+    guidelines_count = len(guidelines)
+
+    # 1. Primary path: CrewAI + Gemini
+    try:
+        crew_output = _run_crewai_text_audit(prompt, api_key)
+        parsed = _extract_json_object(crew_output)
+        return _normalize_text_audit(parsed, text, guidelines_count)
+    except Exception as crew_exc:
+        if _is_auth_error(crew_exc):
+            raise AIConfigurationError(
+                "Your GEMINI_API_KEY was rejected by Google AI. Please verify the key."
+            ) from crew_exc
+        logger.warning(
+            "CrewAI audit fallback triggered (%s: %s). Falling back to direct Gemini JSON.",
+            type(crew_exc).__name__,
+            crew_exc,
+        )
+
+    # 2. Safe fallback path: direct Gemini structured JSON output
+    try:
+        direct_output = _call_gemini_text_json(prompt, api_key)
+        parsed = _extract_json_object(direct_output)
+        return _normalize_text_audit(parsed, text, guidelines_count)
+    except Exception as exc:
+        if _is_auth_error(exc):
+            raise AIConfigurationError(
+                "Your GEMINI_API_KEY was rejected by Google AI. Please verify the key."
+            ) from exc
+        raise RuntimeError(f"AI text compliance audit failed: {exc}") from exc
+
+
+def review_image_compliance(
+    image_bytes: bytes,
+    mime_type: str,
+    guidelines: List[Dict[str, Any]],
+    caption: Optional[str] = None,
+    timeout_seconds: int = VISION_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """
+    Audit an advertisement image + optional caption via Google Gemini Vision
+    (gemini-3.5-flash-lite) with a strict 25-second timeout and structured JSON output.
+    """
+    api_key = _require_api_key()
+    guidelines_block = _format_guidelines_block(guidelines)
+    prompt = _build_vision_prompt(guidelines_block, caption)
+    guidelines_count = len(guidelines)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            _call_gemini_vision_json,
+            image_bytes,
+            mime_type,
+            prompt,
+            api_key,
+        )
         try:
-            from crewai import Agent, Task, Crew, Process  # type: ignore
+            raw_output = future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise AITimeoutError(
+                f"Visual compliance audit timed out after {timeout_seconds} seconds. "
+                "Please try again with a smaller image."
+            ) from exc
+        except Exception as exc:
+            if _is_auth_error(exc):
+                raise AIConfigurationError(
+                    "Your GEMINI_API_KEY was rejected by Google AI. Please verify the key."
+                ) from exc
+            raise RuntimeError(f"AI visual compliance audit failed: {exc}") from exc
 
-            compliance_auditor = Agent(
-                role="Compliance Auditor",
-                goal="Strictly audit submitted draft text against the retrieved ChromaDB brand guidelines.",
-                backstory=(
-                    "You are an uncompromising corporate brand compliance auditor. You inspect every claim, "
-                    "tone choice, and user noun against official BRAND GUIDELINES stored in ChromaDB."
-                ),
-                verbose=False,
-                allow_delegation=False,
-            )
-
-            correction_editor = Agent(
-                role="Correction Editor",
-                goal="Rewrite flagged content so that all brand violations are resolved while preserving original intent.",
-                backstory=(
-                    "You are an expert enterprise copy editor who transforms non-compliant marketing drafts "
-                    "into polished, guideline-compliant communications and outputs strict JSON."
-                ),
-                verbose=False,
-                allow_delegation=False,
-            )
-
-            audit_task = Task(
-                description=(
-                    f"Analyze the following draft text against the BRAND GUIDELINES.\n"
-                    f"GUIDELINES: {guidelines}\n"
-                    f"DRAFT TEXT: {draft_text}\n"
-                    "Identify whether the text should be 'flagged' or 'approved', list the exact broken_rule, "
-                    "and provide a clear explanation."
-                ),
-                expected_output="Detailed audit findings listing broken rules and explanations.",
-                agent=compliance_auditor,
-            )
-
-            edit_task = Task(
-                description=(
-                    f"Based on the Compliance Auditor's findings for DRAFT TEXT: '{draft_text}' and "
-                    f"GUIDELINES: '{guidelines}', produce a compliant rewrite suggestion and return ONLY a valid "
-                    "JSON string matching this exact schema: "
-                    '{"status": "flagged", "broken_rule": "...", "explanation": "...", "suggestion": "..."}'
-                ),
-                expected_output='Strict JSON string matching {"status": "flagged", "broken_rule": "...", "explanation": "...", "suggestion": "..."}',
-                agent=correction_editor,
-                context=[audit_task],
-            )
-
-            crew = Crew(
-                agents=[compliance_auditor, correction_editor],
-                tasks=[audit_task, edit_task],
-                process=Process.sequential,
-                verbose=False,
-            )
-
-            crew_output = crew.kickoff()
-            parsed = _extract_json_payload(str(crew_output))
-            return json.dumps(parsed)
-        except Exception:
-            return _run_deterministic_fallback(draft_text, guidelines)
-
-    return _run_deterministic_fallback(draft_text, guidelines)
+    parsed = _extract_json_object(raw_output)
+    return _normalize_visual_audit(parsed, guidelines_count)

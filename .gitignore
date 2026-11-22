@@ -1,33 +1,23 @@
-# Dependencies
-node_modules/
-frontend/node_modules/
+# Environment secrets
+.env
+backend/.env
+.env.example
 
-# Python virtual environments & cache
+# Python virtual environments & bytecode
 venv/
 .venv/
-backend/venv/
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
 
-# Environment variables
-.env
-.env.local
-
-# Build artifacts
-dist/
-build/
-*.log
-
-# Vector Databases
+# Local vector database storage
 chroma_db/
+backend/chroma_db/
 
-# Credentials
-.env
-.env.example
-*.key
-
-# Environments
-venv/
-env/
-__pycache__/
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
