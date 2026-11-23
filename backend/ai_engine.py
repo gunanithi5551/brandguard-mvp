@@ -21,8 +21,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("brandguard.ai_engine")
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 import time
+
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
@@ -30,6 +31,22 @@ FALLBACK_MODELS = [
     "gemini-3.6-flash",
     "gemini-3.1-flash-lite",
 ]
+
+VISION_TIMEOUT_SECONDS = 45
+
+
+def _make_genai_client(api_key: str):
+    """Fail fast on 503/timeout so _generate_with_fallback can rotate models immediately."""
+    from google import genai
+    from google.genai import types
+
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=15_000,  # 15 seconds in milliseconds
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
 
 
 def _generate_with_fallback(client, *, model: str, **kwargs):
@@ -40,12 +57,24 @@ def _generate_with_fallback(client, *, model: str, **kwargs):
             return client.models.generate_content(model=candidate, **kwargs)
         except Exception as exc:
             last_err = exc
-            if any(code in str(exc) for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
-                time.sleep(0.5)
+            msg = str(exc).lower()
+            if any(
+                token in msg
+                for token in (
+                    "503",
+                    "unavailable",
+                    "429",
+                    "resource_exhausted",
+                    "timeout",
+                    "timed out",
+                    "deadline",
+                )
+            ):
+                logger.warning("Model %s unavailable (%s); trying next fallback.", candidate, exc)
+                time.sleep(0.2)
                 continue
             raise
     raise last_err
-VISION_TIMEOUT_SECONDS = 25
 
 
 class AIConfigurationError(RuntimeError):
@@ -313,12 +342,11 @@ def _run_crewai_text_audit(prompt: str, api_key: str) -> str:
 
 def _call_gemini_text_json(prompt: str, api_key: str) -> str:
     """Direct Google GenAI structured JSON call (used as reliable fallback)."""
-    from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    client = _make_genai_client(api_key)
     response = _generate_with_fallback(
-    client,
+        client,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -336,14 +364,13 @@ def _call_gemini_vision_json(
     api_key: str,
 ) -> str:
     """Direct Google GenAI multimodal Vision call with structured JSON output."""
-    from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    client = _make_genai_client(api_key)
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
     response = _generate_with_fallback(
-    client,
-        model=MODEL_NAME,   
+        client,
+        model=MODEL_NAME,
         contents=[prompt, image_part],
         config=types.GenerateContentConfig(
             temperature=0.1,
