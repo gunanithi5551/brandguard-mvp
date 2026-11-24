@@ -21,60 +21,100 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("brandguard.ai_engine")
 
+import random
 import time
 
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
-    "gemini-3.1-flash-lite",
 ]
 
-VISION_TIMEOUT_SECONDS = 45
+VISION_TIMEOUT_SECONDS = 60
+_EXHAUSTED_MODELS_UNTIL: Dict[str, float] = {}
+
+
+def _get_api_key_pool(primary_key: str) -> List[str]:
+    """Collect unique API keys from GEMINI_API_KEYS, GEMINI_API_KEY, and GEMINI_API_KEY_BACKUP."""
+    raw_list = [primary_key]
+    multi = os.getenv("GEMINI_API_KEYS") or ""
+    raw_list.extend(k.strip() for k in multi.split(",") if k.strip())
+    backup = (os.getenv("GEMINI_API_KEY_BACKUP") or "").strip()
+    if backup:
+        raw_list.append(backup)
+
+    seen = set()
+    pool = []
+    for k in raw_list:
+        if k and not k.lower().startswith("your_") and k not in seen:
+            seen.add(k)
+            pool.append(k)
+    return pool
 
 
 def _make_genai_client(api_key: str):
-    """Fail fast on 503/timeout so _generate_with_fallback can rotate models immediately."""
+    """Allow 25s for multimodal vision while keeping attempts=1 so fallback rotates fast."""
     from google import genai
     from google.genai import types
 
     return genai.Client(
         api_key=api_key,
         http_options=types.HttpOptions(
-            timeout=15_000,  # 15 seconds in milliseconds
+            timeout=25_000,
             retry_options=types.HttpRetryOptions(attempts=1),
         ),
     )
 
 
-def _generate_with_fallback(client, *, model: str, **kwargs):
+def _generate_with_fallback(client, *, model: str, api_key: str = "", **kwargs):
     candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    key_pool = _get_api_key_pool(api_key or get_gemini_api_key())
     last_err = None
-    for candidate in candidates:
-        try:
-            return client.models.generate_content(model=candidate, **kwargs)
-        except Exception as exc:
-            last_err = exc
-            msg = str(exc).lower()
-            if any(
-                token in msg
-                for token in (
-                    "503",
-                    "unavailable",
-                    "429",
-                    "resource_exhausted",
-                    "timeout",
-                    "timed out",
-                    "deadline",
-                )
-            ):
-                logger.warning("Model %s unavailable (%s); trying next fallback.", candidate, exc)
-                time.sleep(0.2)
-                continue
-            raise
-    raise last_err
+
+    for round_idx in range(2):
+        for key_idx, active_key in enumerate(key_pool):
+            active_client = client if (round_idx == 0 and key_idx == 0) else _make_genai_client(active_key)
+            for candidate in candidates:
+                cache_key = f"{active_key[:10]}:{candidate}"
+                if time.time() < _EXHAUSTED_MODELS_UNTIL.get(cache_key, 0):
+                    continue
+                try:
+                    return active_client.models.generate_content(model=candidate, **kwargs)
+                except Exception as exc:
+                    last_err = exc
+                    msg = str(exc).lower()
+                    if "429" in msg or "resource_exhausted" in msg or "perday" in msg:
+                        _EXHAUSTED_MODELS_UNTIL[cache_key] = time.time() + 3600
+                        logger.warning("Quota exhausted for %s on key #%d; skipping.", candidate, key_idx + 1)
+                        continue
+                    if any(
+                        token in msg
+                        for token in (
+                            "503",
+                            "unavailable",
+                            "504",
+                            "404",
+                            "not found",
+                            "timeout",
+                            "timed out",
+                            "deadline",
+                        )
+                    ):
+                        logger.warning(
+                            "Round %d (key #%d): %s unavailable (%s); rotating.",
+                            round_idx + 1,
+                            key_idx + 1,
+                            candidate,
+                            type(exc).__name__,
+                        )
+                        time.sleep(0.3 + random.uniform(0.05, 0.2))
+                        continue
+                    raise
+
+    raise last_err or RuntimeError("All Gemini models and API keys are temporarily unavailable.")
 
 
 class AIConfigurationError(RuntimeError):
@@ -348,6 +388,7 @@ def _call_gemini_text_json(prompt: str, api_key: str) -> str:
     response = _generate_with_fallback(
         client,
         model=MODEL_NAME,
+        api_key=api_key,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.1,
@@ -371,6 +412,7 @@ def _call_gemini_vision_json(
     response = _generate_with_fallback(
         client,
         model=MODEL_NAME,
+        api_key=api_key,
         contents=[prompt, image_part],
         config=types.GenerateContentConfig(
             temperature=0.1,
